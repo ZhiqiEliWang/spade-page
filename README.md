@@ -23,7 +23,7 @@ This repo is configured as a Gradio Space (`sdk: gradio`).
 
 - Endpoint name: `/pipeline`
 - Input: `text` (string)
-- Output: `[detector_output_json, explainer_markdown]`
+- Output (streamed updates): `[detector_output_json_or_partial, explainer_markdown_or_partial]`
 
 ### Replace with your paper models
 
@@ -45,13 +45,12 @@ The static site lives in `docs/`:
 
 ### Configure Space ID
 
-Edit `docs/config.js`:
+The GitHub Pages frontend in `docs/` is fixed to:
 
-```js
-window.SPADE_CONFIG = {
-  spaceId: "your-username/your-space-name",
-};
-```
+`ZhiqiEliWang/SPADE`
+
+`docs/app.js` always connects to that Space when running the pipeline.
+It uses `app.submit("/pipeline", { text })` to render streamed output chunks on the page.
 
 ### Enable GitHub Pages
 

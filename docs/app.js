@@ -1,14 +1,12 @@
 import { Client } from "https://cdn.jsdelivr.net/npm/@gradio/client/+esm";
 
-const spaceInput = document.getElementById("spaceId");
+const FIXED_SPACE_ID = "ZhiqiEliWang/SPADE";
+
 const messageInput = document.getElementById("message");
 const runBtn = document.getElementById("runBtn");
 const detectorOutput = document.getElementById("detectorOutput");
 const explainerOutput = document.getElementById("explainerOutput");
 const statusEl = document.getElementById("status");
-
-const initialSpaceId = window.SPADE_CONFIG?.spaceId || "";
-spaceInput.value = initialSpaceId;
 
 let clientCache = null;
 let cachedSpaceId = null;
@@ -27,14 +25,22 @@ async function getClient(spaceId) {
   return clientCache;
 }
 
+function normalizeText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+
+function renderOutputs(data) {
+  if (!Array.isArray(data)) return;
+  const [detector, explanation] = data;
+  detectorOutput.textContent = normalizeText(detector);
+  explainerOutput.textContent = normalizeText(explanation);
+}
+
 async function runPipeline() {
-  const spaceId = spaceInput.value.trim();
   const text = messageInput.value.trim();
 
-  if (!spaceId) {
-    setStatus("Please set your Hugging Face Space ID.", true);
-    return;
-  }
   if (!text) {
     setStatus("Please enter input text.", true);
     return;
@@ -42,14 +48,29 @@ async function runPipeline() {
 
   runBtn.disabled = true;
   setStatus("Running...");
+  detectorOutput.textContent = "";
+  explainerOutput.textContent = "";
 
   try {
-    const app = await getClient(spaceId);
-    const result = await app.predict("/pipeline", { text });
-    const [detector, explanation] = result.data;
+    const app = await getClient(FIXED_SPACE_ID);
+    const job = app.submit("/pipeline", { text });
+    let streamed = false;
+    const supportsStreaming = typeof job?.[Symbol.asyncIterator] === "function";
 
-    detectorOutput.textContent = JSON.stringify(detector, null, 2);
-    explainerOutput.textContent = explanation;
+    if (supportsStreaming) {
+      for await (const message of job) {
+        if (message.type === "data") {
+          renderOutputs(message.data);
+          streamed = true;
+          setStatus("Streaming...");
+        }
+      }
+    }
+
+    const result = await job;
+    if (!streamed && result?.data) {
+      renderOutputs(result.data);
+    }
     setStatus("Done.");
   } catch (err) {
     setStatus(`Request failed: ${err.message || String(err)}`, true);
