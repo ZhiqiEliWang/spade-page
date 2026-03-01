@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SPADE Demo</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <p class="kicker">SPADE Demo</p>
+        <h1>Detector + Explainer</h1>
+        <p class="subtitle">Detector output feeds directly into explainer output.</p>
+      </header>
+
+      <section class="card setup-card">
+        <div class="section-head">
+          <h2>Connection</h2>
+          <p class="hint">Set a default in <code>/docs/config.js</code>.</p>
+        </div>
+        <label for="spaceId">Hugging Face Space ID</label>
+        <input id="spaceId" type="text" placeholder="your-username/your-space-name" />
+      </section>
+
+      <section class="card run-card">
+        <div class="section-head">
+          <h2>Input Message</h2>
+        </div>
+        <label for="message">Input message x</label>
+        <textarea id="message" rows="8" placeholder="Type a message..."></textarea>
+        <button id="runBtn" type="button">Run Detector + Explainer</button>
+      </section>
+
+      <section class="outputs-grid">
+        <article class="card output-card">
+          <h2>Detector Output</h2>
+          <pre id="detectorOutput">{}</pre>
+        </article>
+
+        <article class="card output-card">
+          <h2>Explainer Output</h2>
+          <div id="explainerOutput" class="explainer">No output yet.</div>
+        </article>
+      </section>
+
+      <p id="status" class="status"></p>
+    </main>
+
+    <script src="./config.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
