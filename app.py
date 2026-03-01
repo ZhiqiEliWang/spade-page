@@ -261,6 +261,55 @@ body.dark .gradio-container,
   min-height: 240px;
 }
 
+.verdict-card h3 {
+  margin: 0 0 0.55rem !important;
+  font-size: 16px !important;
+  font-weight: 600 !important;
+  color: var(--text) !important;
+}
+
+.scam-verdict {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 0.85rem;
+  background: #fbfbfc;
+}
+
+.scam-chip {
+  display: inline-block;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.25;
+  padding: 0.24rem 0.58rem;
+}
+
+.scam-note {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.scam-verdict.scam .scam-chip {
+  background: #fef3f2;
+  border-color: #fecdca;
+  color: #b42318;
+}
+
+.scam-verdict.legit .scam-chip {
+  background: #ecfdf3;
+  border-color: #abefc6;
+  color: #067647;
+}
+
+.scam-verdict.pending .scam-chip,
+.scam-verdict.unknown .scam-chip {
+  background: #eef2f7;
+  border-color: #d9dde3;
+  color: #344054;
+}
+
 .output-left label,
 .output-right label {
   color: var(--text) !important;
@@ -486,9 +535,23 @@ def _get_prompt_parts(generator: Any, system_prompt: str, thinking: bool) -> Tup
             _PROMPT_TEMPLATE_CACHE[cache_key] = template
             logger.info("Cached prompt template for tokenizer id=%s", id(tokenizer))
 
-    if USER_PLACEHOLDER not in template:
-        return template, ""
-    return template.split(USER_PLACEHOLDER, 1)
+    system_template = tokenizer.apply_chat_template(
+        [{"role": "system", "content": system_prompt}],
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=thinking,
+    )
+
+    if template.startswith(system_template):
+        dynamic_template = template[len(system_template):]
+        if USER_PLACEHOLDER in dynamic_template:
+            return system_template, dynamic_template
+
+    # Fallback: still excludes user prompt text itself from cache, but may include role wrappers.
+    if USER_PLACEHOLDER in template:
+        prefix, suffix = template.split(USER_PLACEHOLDER, 1)
+        return prefix, f"{USER_PLACEHOLDER}{suffix}"
+    return system_template, USER_PLACEHOLDER
 
 
 def _disk_cache_paths(generator: Any, system_prompt: str, thinking: bool) -> Tuple[Path, Path]:
@@ -507,7 +570,6 @@ def _load_prefix_kv_from_disk(
     generator: Any,
     system_prompt: str,
     prefix_hash: str,
-    suffix_hash: str,
     thinking: bool,
 ) -> Tuple[Any, int] | None:
     if not ENABLE_DISK_KV_CACHE:
@@ -526,7 +588,6 @@ def _load_prefix_kv_from_disk(
             "transformers_version": transformers_version,
             "system_prompt_hash": _sha256_text(system_prompt),
             "prefix_hash": prefix_hash,
-            "suffix_hash": suffix_hash,
             "thinking": thinking,
         }
         for key, expected_value in expected.items():
@@ -553,7 +614,6 @@ def _save_prefix_kv_to_disk(
     generator: Any,
     system_prompt: str,
     prefix_hash: str,
-    suffix_hash: str,
     past_key_values: Any,
     prefix_len: int,
     thinking: bool,
@@ -580,7 +640,6 @@ def _save_prefix_kv_to_disk(
             "tokenizer_name_or_path": tokenizer_name,
             "system_prompt_hash": _sha256_text(system_prompt),
             "prefix_hash": prefix_hash,
-            "suffix_hash": suffix_hash,
             "thinking": thinking,
         }
         torch.save(payload, pt_path)
@@ -606,9 +665,8 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
         )
         return cached
 
-    prefix, suffix = _get_prompt_parts(generator, system_prompt, thinking)
+    prefix, dynamic_template = _get_prompt_parts(generator, system_prompt, thinking)
     prefix_hash = _sha256_text(prefix)
-    suffix_hash = _sha256_text(suffix)
     logger.info(
         "[DEBUG] Prefix KV cache source=memory_miss model_id=%s thinking=%s; checking disk",
         id(model),
@@ -619,13 +677,12 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
         generator,
         system_prompt,
         prefix_hash,
-        suffix_hash,
         thinking,
     )
     if disk_cache is not None:
         past_key_values, prefix_len = disk_cache
         with _PREFIX_KV_CACHE_LOCK:
-            _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, suffix)
+            _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, dynamic_template)
         logger.info(
             "[DEBUG] Prefix KV cache source=disk_hit model_id=%s thinking=%s prefix_tokens=%s",
             id(model),
@@ -650,12 +707,11 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
     prefix_len = int(encoded_prefix["input_ids"].shape[1])
     past_key_values = outputs.past_key_values
     with _PREFIX_KV_CACHE_LOCK:
-        _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, suffix)
+        _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, dynamic_template)
     _save_prefix_kv_to_disk(
         generator=generator,
         system_prompt=system_prompt,
         prefix_hash=prefix_hash,
-        suffix_hash=suffix_hash,
         past_key_values=past_key_values,
         prefix_len=prefix_len,
         thinking=thinking,
@@ -724,9 +780,9 @@ def _generate_text_stream(
             if force_full_prompt:
                 raise RuntimeError("force_full_prompt enabled")
 
-            past_key_values, prefix_len, suffix = _get_prefix_kv(generator, system_prompt, thinking)
+            past_key_values, prefix_len, dynamic_template = _get_prefix_kv(generator, system_prompt, thinking)
             past_key_values = _clone_past_key_values_for_inference(past_key_values)
-            dynamic_prompt = f"{user_prompt}{suffix}"
+            dynamic_prompt = dynamic_template.replace(USER_PLACEHOLDER, user_prompt, 1)
             encoded_dynamic = generator.tokenizer(dynamic_prompt, return_tensors="pt")
             encoded_dynamic = _move_inputs_to_generator_device(generator, encoded_dynamic)
             dynamic_len = int(encoded_dynamic["input_ids"].shape[1])
@@ -926,6 +982,50 @@ def _build_detector_output(raw: str, empty_input: bool = False) -> Dict[str, Any
     }
 
 
+def _coerce_scam_flag(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return value if value in (0, 1) else None
+    if isinstance(value, float):
+        return int(value) if value in (0.0, 1.0) else None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true"}:
+            return 1
+        if normalized in {"0", "false"}:
+            return 0
+    return None
+
+
+def _render_scam_verdict_html(detector_output: Dict[str, Any] | None, pending: bool = False) -> str:
+    if pending:
+        state = "pending"
+        chip = "Waiting For Detector"
+        note = "Scam verdict appears after detector output is finalized."
+    else:
+        scam_flag = _coerce_scam_flag((detector_output or {}).get("scam"))
+        if scam_flag == 1:
+            state = "scam"
+            chip = "Scam Detected"
+            note = 'Detector returned `"scam": 1`.'
+        elif scam_flag == 0:
+            state = "legit"
+            chip = "Not A Scam"
+            note = 'Detector returned `"scam": 0`.'
+        else:
+            state = "unknown"
+            chip = "Scam Verdict Unknown"
+            note = 'Could not read a valid `"scam"` value from detector output.'
+
+    return (
+        f'<div class="scam-verdict {state}">'
+        f'<span class="scam-chip">{chip}</span>'
+        f'<p class="scam-note">{note}</p>'
+        "</div>"
+    )
+
+
 def run_detector_stream(text: str, task_name: str = "detector") -> Iterator[str]:
     cleaned = text.strip()
     if not cleaned:
@@ -1029,21 +1129,23 @@ def run_explainer(text: str, detector_output: Dict[str, Any]) -> str:
     return _normalize_visible_escapes(_fallback_explanation(detector_output))
 
 
-def pipeline(text: str) -> Iterator[Tuple[str, str]]:
+def pipeline(text: str) -> Iterator[Tuple[str, str, str]]:
     req_id = f"req-{int(time.time() * 1000)}"
     started = time.perf_counter()
     logger.info("[%s] Pipeline started.", req_id)
 
     detector_render = ""
     explainer_render = ""
-    yield detector_render, explainer_render
+    verdict_render = _render_scam_verdict_html(detector_output=None, pending=True)
+    yield detector_render, explainer_render, verdict_render
 
     cleaned = text.strip()
     if not cleaned:
         detector_output = _build_detector_output(raw="", empty_input=True)
         detector_render = json.dumps(detector_output, ensure_ascii=True, indent=2)
         explainer_render = _normalize_visible_escapes(_fallback_explanation(detector_output))
-        yield detector_render, explainer_render
+        verdict_render = _render_scam_verdict_html(detector_output=detector_output)
+        yield detector_render, explainer_render, verdict_render
         elapsed = time.perf_counter() - started
         logger.info("[%s] Pipeline finished in %.2fs", req_id, elapsed)
         return
@@ -1053,11 +1155,12 @@ def pipeline(text: str) -> Iterator[Tuple[str, str]]:
     for partial in run_detector_stream(cleaned, task_name=f"{req_id}:detector"):
         detector_raw = partial
         detector_render = detector_raw
-        yield detector_render, explainer_render
+        yield detector_render, explainer_render, verdict_render
 
     detector_output = _build_detector_output(raw=detector_raw, empty_input=False)
     detector_render = json.dumps(detector_output, ensure_ascii=True, indent=2)
-    yield detector_render, explainer_render
+    verdict_render = _render_scam_verdict_html(detector_output=detector_output)
+    yield detector_render, explainer_render, verdict_render
 
     logger.info("[%s] Explainer stream started.", req_id)
     explanation = ""
@@ -1068,7 +1171,7 @@ def pipeline(text: str) -> Iterator[Tuple[str, str]]:
     ):
         explanation = partial
         explainer_render = explanation
-        yield detector_render, explainer_render
+        yield detector_render, explainer_render, verdict_render
 
     if not explanation.strip():
         logger.warning("[%s] Explainer empty; retrying with simplified prompt.", req_id)
@@ -1080,21 +1183,21 @@ def pipeline(text: str) -> Iterator[Tuple[str, str]]:
         ):
             retry = partial
             explainer_render = retry
-            yield detector_render, explainer_render
+            yield detector_render, explainer_render, verdict_render
         explanation = retry
 
     if not explanation.strip():
         logger.warning("[%s] Explainer still empty; using fallback.", req_id)
         explanation = _fallback_explanation(detector_output)
         explainer_render = explanation
-        yield detector_render, explainer_render
+        yield detector_render, explainer_render, verdict_render
 
     normalized_explanation = _normalize_visible_escapes(explanation)
     if normalized_explanation != explainer_render:
         explainer_render = normalized_explanation
-        yield detector_render, explainer_render
+        yield detector_render, explainer_render, verdict_render
 
-    yield detector_render, explainer_render
+    yield detector_render, explainer_render, verdict_render
     elapsed = time.perf_counter() - started
     logger.info("[%s] Pipeline finished in %.2fs", req_id, elapsed)
 
@@ -1162,6 +1265,12 @@ with gr.Blocks(title="SPADE Demo API", css=CUSTOM_CSS) as demo:
             )
             run_btn = gr.Button("Run Pipeline", elem_id="run-btn")
 
+        with gr.Group(elem_classes=["section-card", "verdict-card"]):
+            gr.Markdown("### Scam Verdict")
+            scam_verdict = gr.HTML(
+                value=_render_scam_verdict_html(detector_output=None, pending=True),
+            )
+
         with gr.Row(elem_id="outputs-row", equal_height=True):
             with gr.Column(scale=1, min_width=360):
                 with gr.Group(elem_classes=["section-card", "output-left"]):
@@ -1181,11 +1290,11 @@ with gr.Blocks(title="SPADE Demo API", css=CUSTOM_CSS) as demo:
     run_btn.click(
         fn=pipeline,
         inputs=input_text,
-        outputs=[detector_json, explainer_md],
+        outputs=[detector_json, explainer_md, scam_verdict],
         api_name="pipeline",
     )
 
 
 if __name__ == "__main__":
     warmup_prefix_kv_cache()
-    demo.queue(default_concurrency_limit=8, max_size=64).launch()
+    demo.queue(default_concurrency_limit=1, max_size=64).launch()

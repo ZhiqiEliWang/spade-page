@@ -20,7 +20,16 @@
         </div>
         <label for="message">Input message x</label>
         <textarea id="message" rows="8" placeholder="Type a message..."></textarea>
+        <div id="exampleMessages" class="example-messages" hidden></div>
         <button id="runBtn" type="button">Run Detector + Explainer</button>
+      </section>
+
+      <section class="card verdict-card">
+        <h2>Scam Verdict</h2>
+        <div id="scamVerdict" class="scam-verdict pending">
+          <span class="scam-chip">Waiting For Detector</span>
+          <p class="scam-note">Scam verdict appears after detector output is finalized.</p>
+        </div>
       </section>
 
       <section class="outputs-grid">

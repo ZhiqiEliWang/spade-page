@@ -132,6 +132,74 @@ button:disabled {
   cursor: default;
 }
 
+.example-messages {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.example-message-btn {
+  margin-top: 0;
+  border: 1px solid var(--border);
+  background: #f7f8fa;
+  color: var(--text);
+  font-weight: 500;
+  min-height: 32px;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.example-message-btn:hover {
+  background: #eef2f7;
+}
+
+.verdict-card h2 {
+  margin-bottom: 10px;
+}
+
+.scam-verdict {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #fbfbfc;
+}
+
+.scam-chip {
+  display: inline-block;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.25;
+  padding: 4px 10px;
+}
+
+.scam-note {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.scam-verdict.scam .scam-chip {
+  background: #fef3f2;
+  border-color: #fecdca;
+  color: #b42318;
+}
+
+.scam-verdict.legit .scam-chip {
+  background: #ecfdf3;
+  border-color: #abefc6;
+  color: #067647;
+}
+
+.scam-verdict.pending .scam-chip,
+.scam-verdict.unknown .scam-chip {
+  background: #eef2f7;
+  border-color: #d9dde3;
+  color: #344054;
+}
+
 .outputs-grid {
   margin-top: 4px;
   display: grid;
