@@ -9,7 +9,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 from queue import Empty
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Dict, Iterator, Tuple
 
 import gradio as gr
@@ -55,6 +55,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("spade")
 _PROMPT_TEMPLATE_CACHE: Dict[Tuple[int, str, bool], str] = {}
 _PREFIX_KV_CACHE: Dict[Tuple[int, str, bool], Tuple[Any, int, str]] = {}
+_PROMPT_TEMPLATE_CACHE_LOCK = Lock()
+_PREFIX_KV_CACHE_LOCK = Lock()
+_MODEL_LOCKS: Dict[int, Lock] = {}
+_MODEL_LOCKS_LOCK = Lock()
 
 CUSTOM_CSS = """
 :root {
@@ -230,6 +234,21 @@ body.dark .gradio-container,
   color: var(--text) !important;
 }
 
+.output-left .cm-scroller,
+.output-left .cm-content,
+.output-left .cm-line {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+
+.output-right .prose,
+.output-right .markdown {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+
 .gradio-container .prose,
 .gradio-container .prose *,
 .gradio-container .markdown,
@@ -369,21 +388,21 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 def _build_prompt(generator: Any, system_prompt: str, user_prompt: str, thinking: bool) -> str:
     tokenizer = generator.tokenizer
     cache_key = (id(tokenizer), system_prompt, thinking)
-    template = _PROMPT_TEMPLATE_CACHE.get(cache_key)
-
-    if template is None:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": USER_PLACEHOLDER},
-        ]
-        template = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=thinking
-        )
-        _PROMPT_TEMPLATE_CACHE[cache_key] = template
-        logger.info("Cached prompt template for tokenizer id=%s", id(tokenizer))
+    with _PROMPT_TEMPLATE_CACHE_LOCK:
+        template = _PROMPT_TEMPLATE_CACHE.get(cache_key)
+        if template is None:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": USER_PLACEHOLDER},
+            ]
+            template = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=thinking
+            )
+            _PROMPT_TEMPLATE_CACHE[cache_key] = template
+            logger.info("Cached prompt template for tokenizer id=%s", id(tokenizer))
 
     return template.replace(USER_PLACEHOLDER, user_prompt, 1)
 
@@ -425,6 +444,11 @@ def _cpu_clone_past_key_values(past_key_values: Any) -> Any:
     return _tensor_tree_map(past_key_values, lambda t: t.detach().to("cpu"))
 
 
+def _clone_past_key_values_for_inference(past_key_values: Any) -> Any:
+    # Never pass shared cache tensors directly into generate(); they may be mutated in-place.
+    return _tensor_tree_map(past_key_values, lambda t: t.detach().clone())
+
+
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -433,24 +457,34 @@ def _sanitize_key(key: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", key)
 
 
+def _get_model_lock(model: Any) -> Lock:
+    model_id = id(model)
+    with _MODEL_LOCKS_LOCK:
+        lock = _MODEL_LOCKS.get(model_id)
+        if lock is None:
+            lock = Lock()
+            _MODEL_LOCKS[model_id] = lock
+        return lock
+
+
 def _get_prompt_parts(generator: Any, system_prompt: str, thinking: bool) -> Tuple[str, str]:
     tokenizer = generator.tokenizer
     cache_key = (id(tokenizer), system_prompt, thinking)
-    template = _PROMPT_TEMPLATE_CACHE.get(cache_key)
-
-    if template is None:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": USER_PLACEHOLDER},
-        ]
-        template = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=thinking
-        )
-        _PROMPT_TEMPLATE_CACHE[cache_key] = template
-        logger.info("Cached prompt template for tokenizer id=%s", id(tokenizer))
+    with _PROMPT_TEMPLATE_CACHE_LOCK:
+        template = _PROMPT_TEMPLATE_CACHE.get(cache_key)
+        if template is None:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": USER_PLACEHOLDER},
+            ]
+            template = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=thinking
+            )
+            _PROMPT_TEMPLATE_CACHE[cache_key] = template
+            logger.info("Cached prompt template for tokenizer id=%s", id(tokenizer))
 
     if USER_PLACEHOLDER not in template:
         return template, ""
@@ -561,7 +595,8 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
     model = generator.model
     tokenizer = generator.tokenizer
     cache_key = (id(model), system_prompt, thinking)
-    cached = _PREFIX_KV_CACHE.get(cache_key)
+    with _PREFIX_KV_CACHE_LOCK:
+        cached = _PREFIX_KV_CACHE.get(cache_key)
     if cached is not None:
         logger.info(
             "[DEBUG] Prefix KV cache source=memory_hit model_id=%s thinking=%s prefix_tokens=%s",
@@ -589,14 +624,16 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
     )
     if disk_cache is not None:
         past_key_values, prefix_len = disk_cache
-        _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, suffix)
+        with _PREFIX_KV_CACHE_LOCK:
+            _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, suffix)
         logger.info(
             "[DEBUG] Prefix KV cache source=disk_hit model_id=%s thinking=%s prefix_tokens=%s",
             id(model),
             thinking,
             prefix_len,
         )
-        return _PREFIX_KV_CACHE[cache_key]
+        with _PREFIX_KV_CACHE_LOCK:
+            return _PREFIX_KV_CACHE[cache_key]
 
     logger.info(
         "[DEBUG] Prefix KV cache source=disk_miss model_id=%s thinking=%s; recomputing",
@@ -612,7 +649,8 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
 
     prefix_len = int(encoded_prefix["input_ids"].shape[1])
     past_key_values = outputs.past_key_values
-    _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, suffix)
+    with _PREFIX_KV_CACHE_LOCK:
+        _PREFIX_KV_CACHE[cache_key] = (past_key_values, prefix_len, suffix)
     _save_prefix_kv_to_disk(
         generator=generator,
         system_prompt=system_prompt,
@@ -628,7 +666,8 @@ def _get_prefix_kv(generator: Any, system_prompt: str, thinking: bool) -> Tuple[
         thinking,
         prefix_len,
     )
-    return _PREFIX_KV_CACHE[cache_key]
+    with _PREFIX_KV_CACHE_LOCK:
+        return _PREFIX_KV_CACHE[cache_key]
 
 
 def _resolve_eos_ids(generator: Any) -> Any:
@@ -666,9 +705,8 @@ def _generate_text_stream(
         pad_token_id = getattr(generator.tokenizer, "eos_token_id", None)
 
     t0 = time.perf_counter()
-    generate_kwargs: Dict[str, Any]
-    path_label = "prefix_kv"
-    kv_cache_applied = True
+    model_lock = _get_model_lock(generator.model)
+    retry_with_full_prompt = False
 
     logger.info(
         "[DEBUG] [%s] Generation started (max_new_tokens=%s, thinking=%s)",
@@ -677,160 +715,170 @@ def _generate_text_stream(
         thinking,
     )
 
-    try:
-        if force_full_prompt:
-            raise RuntimeError("force_full_prompt enabled")
+    with model_lock:
+        generate_kwargs: Dict[str, Any]
+        path_label = "prefix_kv"
+        kv_cache_applied = True
 
-        past_key_values, prefix_len, suffix = _get_prefix_kv(generator, system_prompt, thinking)
-        dynamic_prompt = f"{user_prompt}{suffix}"
-        encoded_dynamic = generator.tokenizer(dynamic_prompt, return_tensors="pt")
-        encoded_dynamic = _move_inputs_to_generator_device(generator, encoded_dynamic)
-        dynamic_len = int(encoded_dynamic["input_ids"].shape[1])
-        if dynamic_len <= 0:
-            raise RuntimeError("Dynamic prompt tokenized to 0 tokens on prefix-KV path.")
-
-        attention_mask = torch.ones(
-            (1, prefix_len + dynamic_len),
-            dtype=encoded_dynamic["attention_mask"].dtype,
-            device=encoded_dynamic["attention_mask"].device,
-        )
-        cache_position = torch.arange(
-            prefix_len,
-            prefix_len + dynamic_len,
-            dtype=torch.long,
-            device=encoded_dynamic["input_ids"].device,
-        )
-        logger.info(
-            "[DEBUG] [%s] Prefix-KV input lengths: prefix_tokens=%s dynamic_tokens=%s cache_position_len=%s",
-            task_name,
-            prefix_len,
-            dynamic_len,
-            int(cache_position.numel()),
-        )
-
-        generate_kwargs = {
-            "input_ids": encoded_dynamic["input_ids"],
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "cache_position": cache_position,
-            "max_new_tokens": max_new_tokens,
-            "do_sample": True,
-            "temperature": TEMPERATURE,
-            "top_k": TOP_K,
-            "top_p": TOP_P,
-            "use_cache": True,
-            "eos_token_id": eos_ids,
-            "pad_token_id": pad_token_id,
-        }
-    except Exception as exc:
-        path_label = "full_prompt"
-        kv_cache_applied = False
-        if not force_full_prompt:
-            logger.warning("[DEBUG] KV-cache path failed, falling back to full prompt path: %s", exc)
-        prompt = _build_prompt(generator, system_prompt, user_prompt, thinking)
-        encoded_prompt = generator.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=NUM_CTX,
-        )
-        encoded_prompt = _move_inputs_to_generator_device(generator, encoded_prompt)
-        generate_kwargs = {
-            "input_ids": encoded_prompt["input_ids"],
-            "attention_mask": encoded_prompt.get("attention_mask"),
-            "max_new_tokens": max_new_tokens,
-            "do_sample": True,
-            "temperature": TEMPERATURE,
-            "top_k": TOP_K,
-            "top_p": TOP_P,
-            "use_cache": True,
-            "eos_token_id": eos_ids,
-            "pad_token_id": pad_token_id,
-        }
-
-    streamer = TextIteratorStreamer(
-        generator.tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=False,
-        timeout=1.0,
-    )
-    generate_kwargs["streamer"] = streamer
-
-    generation_error: Dict[str, Exception] = {}
-
-    def _worker() -> None:
         try:
-            with torch.inference_mode():
-                generator.model.generate(**generate_kwargs)
-        except Exception as exc:
-            generation_error["error"] = exc
+            if force_full_prompt:
+                raise RuntimeError("force_full_prompt enabled")
 
-    worker = Thread(target=_worker, daemon=True)
-    worker.start()
+            past_key_values, prefix_len, suffix = _get_prefix_kv(generator, system_prompt, thinking)
+            past_key_values = _clone_past_key_values_for_inference(past_key_values)
+            dynamic_prompt = f"{user_prompt}{suffix}"
+            encoded_dynamic = generator.tokenizer(dynamic_prompt, return_tensors="pt")
+            encoded_dynamic = _move_inputs_to_generator_device(generator, encoded_dynamic)
+            dynamic_len = int(encoded_dynamic["input_ids"].shape[1])
+            if dynamic_len <= 0:
+                raise RuntimeError("Dynamic prompt tokenized to 0 tokens on prefix-KV path.")
 
-    text = ""
-    first_token_latency_ms: float | None = None
-    stop_seen = False
-    while True:
-        try:
-            chunk = next(streamer)
-        except StopIteration:
-            break
-        except Empty:
-            if worker.is_alive():
-                continue
-            break
-
-        if stop_seen:
-            continue
-
-        if first_token_latency_ms is None:
-            first_token_latency_ms = (time.perf_counter() - t0) * 1000.0
-
-        text += chunk
-        if STOP_TOKEN in text:
-            text = text.split(STOP_TOKEN, 1)[0]
-            stop_seen = True
-        yield text.strip()
-
-    worker.join()
-    if "error" in generation_error:
-        elapsed = time.perf_counter() - t0
-        logger.error(
-            "[DEBUG] [%s] Generation failed after %.2fs (kv_cache_applied=%s, path=%s, first_token_latency_ms=%s, output_chars=%s): %s",
-            task_name,
-            elapsed,
-            kv_cache_applied,
-            path_label,
-            f"{first_token_latency_ms:.1f}" if first_token_latency_ms is not None else "none",
-            len(text),
-            generation_error["error"],
-        )
-        if kv_cache_applied and not force_full_prompt:
-            logger.warning("[DEBUG] [%s] Retrying generation with full_prompt path.", task_name)
-            yield from _generate_text_stream(
-                generator=generator,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_new_tokens=max_new_tokens,
-                thinking=thinking,
-                task_name=f"{task_name}:full_prompt_retry",
-                force_full_prompt=True,
+            attention_mask = torch.ones(
+                (1, prefix_len + dynamic_len),
+                dtype=encoded_dynamic["attention_mask"].dtype,
+                device=encoded_dynamic["attention_mask"].device,
             )
-            return
-        raise generation_error["error"]
+            cache_position = torch.arange(
+                prefix_len,
+                prefix_len + dynamic_len,
+                dtype=torch.long,
+                device=encoded_dynamic["input_ids"].device,
+            )
+            logger.info(
+                "[DEBUG] [%s] Prefix-KV input lengths: prefix_tokens=%s dynamic_tokens=%s cache_position_len=%s",
+                task_name,
+                prefix_len,
+                dynamic_len,
+                int(cache_position.numel()),
+            )
 
-    elapsed = time.perf_counter() - t0
-    logger.info(
-        "[DEBUG] [%s] Generation complete in %.2fs (max_new_tokens=%s, kv_cache_applied=%s, path=%s, first_token_latency_ms=%s, output_chars=%s)",
-        task_name,
-        elapsed,
-        max_new_tokens,
-        kv_cache_applied,
-        path_label,
-        f"{first_token_latency_ms:.1f}" if first_token_latency_ms is not None else "none",
-        len(text),
-    )
+            generate_kwargs = {
+                "input_ids": encoded_dynamic["input_ids"],
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "cache_position": cache_position,
+                "max_new_tokens": max_new_tokens,
+                "do_sample": True,
+                "temperature": TEMPERATURE,
+                "top_k": TOP_K,
+                "top_p": TOP_P,
+                "use_cache": True,
+                "eos_token_id": eos_ids,
+                "pad_token_id": pad_token_id,
+            }
+        except Exception as exc:
+            path_label = "full_prompt"
+            kv_cache_applied = False
+            if not force_full_prompt:
+                logger.warning("[DEBUG] KV-cache path failed, falling back to full prompt path: %s", exc)
+            prompt = _build_prompt(generator, system_prompt, user_prompt, thinking)
+            encoded_prompt = generator.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=NUM_CTX,
+            )
+            encoded_prompt = _move_inputs_to_generator_device(generator, encoded_prompt)
+            generate_kwargs = {
+                "input_ids": encoded_prompt["input_ids"],
+                "attention_mask": encoded_prompt.get("attention_mask"),
+                "max_new_tokens": max_new_tokens,
+                "do_sample": True,
+                "temperature": TEMPERATURE,
+                "top_k": TOP_K,
+                "top_p": TOP_P,
+                "use_cache": True,
+                "eos_token_id": eos_ids,
+                "pad_token_id": pad_token_id,
+            }
+
+        streamer = TextIteratorStreamer(
+            generator.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=False,
+            timeout=1.0,
+        )
+        generate_kwargs["streamer"] = streamer
+
+        generation_error: Dict[str, Exception] = {}
+
+        def _worker() -> None:
+            try:
+                with torch.inference_mode():
+                    generator.model.generate(**generate_kwargs)
+            except Exception as exc:
+                generation_error["error"] = exc
+
+        worker = Thread(target=_worker, daemon=True)
+        worker.start()
+
+        text = ""
+        first_token_latency_ms: float | None = None
+        stop_seen = False
+        while True:
+            try:
+                chunk = next(streamer)
+            except StopIteration:
+                break
+            except Empty:
+                if worker.is_alive():
+                    continue
+                break
+
+            if stop_seen:
+                continue
+
+            if first_token_latency_ms is None:
+                first_token_latency_ms = (time.perf_counter() - t0) * 1000.0
+
+            text += chunk
+            if STOP_TOKEN in text:
+                text = text.split(STOP_TOKEN, 1)[0]
+                stop_seen = True
+            yield text.strip()
+
+        worker.join()
+        if "error" in generation_error:
+            elapsed = time.perf_counter() - t0
+            logger.error(
+                "[DEBUG] [%s] Generation failed after %.2fs (kv_cache_applied=%s, path=%s, first_token_latency_ms=%s, output_chars=%s): %s",
+                task_name,
+                elapsed,
+                kv_cache_applied,
+                path_label,
+                f"{first_token_latency_ms:.1f}" if first_token_latency_ms is not None else "none",
+                len(text),
+                generation_error["error"],
+            )
+            if kv_cache_applied and not force_full_prompt:
+                logger.warning("[DEBUG] [%s] Retrying generation with full_prompt path.", task_name)
+                retry_with_full_prompt = True
+            else:
+                raise generation_error["error"]
+        else:
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                "[DEBUG] [%s] Generation complete in %.2fs (max_new_tokens=%s, kv_cache_applied=%s, path=%s, first_token_latency_ms=%s, output_chars=%s)",
+                task_name,
+                elapsed,
+                max_new_tokens,
+                kv_cache_applied,
+                path_label,
+                f"{first_token_latency_ms:.1f}" if first_token_latency_ms is not None else "none",
+                len(text),
+            )
+
+    if retry_with_full_prompt:
+        yield from _generate_text_stream(
+            generator=generator,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_new_tokens=max_new_tokens,
+            thinking=thinking,
+            task_name=f"{task_name}:full_prompt_retry",
+            force_full_prompt=True,
+        )
+        return
 
 
 def _generate_text(
@@ -926,6 +974,14 @@ def _fallback_explanation(detector_output: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_visible_escapes(text: str) -> str:
+    if not text:
+        return text
+    if "\\n" not in text and "\\r" not in text and "\\t" not in text:
+        return text
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+
+
 def run_explainer_stream(
     detector_output: Dict[str, Any],
     simplified_prompt: bool = False,
@@ -960,17 +1016,17 @@ def run_explainer(text: str, detector_output: Dict[str, Any]) -> str:
     for partial in run_explainer_stream(detector_output, simplified_prompt=False, task_name="explainer"):
         explanation = partial
     if explanation.strip():
-        return explanation
+        return _normalize_visible_escapes(explanation)
 
     logger.warning("Explainer returned empty text; retrying with simplified prompt.")
     retry = ""
     for partial in run_explainer_stream(detector_output, simplified_prompt=True, task_name="explainer_retry"):
         retry = partial
     if retry.strip():
-        return retry
+        return _normalize_visible_escapes(retry)
 
     logger.warning("Explainer retry also empty; using deterministic fallback explanation.")
-    return _fallback_explanation(detector_output)
+    return _normalize_visible_escapes(_fallback_explanation(detector_output))
 
 
 def pipeline(text: str) -> Iterator[Tuple[str, str]]:
@@ -986,7 +1042,7 @@ def pipeline(text: str) -> Iterator[Tuple[str, str]]:
     if not cleaned:
         detector_output = _build_detector_output(raw="", empty_input=True)
         detector_render = json.dumps(detector_output, ensure_ascii=True, indent=2)
-        explainer_render = _fallback_explanation(detector_output)
+        explainer_render = _normalize_visible_escapes(_fallback_explanation(detector_output))
         yield detector_render, explainer_render
         elapsed = time.perf_counter() - started
         logger.info("[%s] Pipeline finished in %.2fs", req_id, elapsed)
@@ -1031,6 +1087,11 @@ def pipeline(text: str) -> Iterator[Tuple[str, str]]:
         logger.warning("[%s] Explainer still empty; using fallback.", req_id)
         explanation = _fallback_explanation(detector_output)
         explainer_render = explanation
+        yield detector_render, explainer_render
+
+    normalized_explanation = _normalize_visible_escapes(explanation)
+    if normalized_explanation != explainer_render:
+        explainer_render = normalized_explanation
         yield detector_render, explainer_render
 
     yield detector_render, explainer_render
@@ -1127,4 +1188,4 @@ with gr.Blocks(title="SPADE Demo API", css=CUSTOM_CSS) as demo:
 
 if __name__ == "__main__":
     warmup_prefix_kv_cache()
-    demo.queue().launch()
+    demo.queue(default_concurrency_limit=8, max_size=64).launch()
