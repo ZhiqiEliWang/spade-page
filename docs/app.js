@@ -2,10 +2,17 @@ import { Client } from "https://cdn.jsdelivr.net/npm/@gradio/client/+esm";
 
 const FIXED_SPACE_ID = "ZhiqiEliWang/SPADE";
 const EXAMPLE_MESSAGES_GH_PAGE = [
-  "Congratulations! You've been selected for a chance to get a brand new iPhone for just $1. Click here to claim now!",
-  "Dear user, your account has been compromised. Please reset your password immediately by clicking on this link.",
-  "You have won a free vacation to the Bahamas! Call now to claim your prize.",
-  "This is a reminder that your subscription will expire soon. Please renew to continue enjoying our services.",
+  "this is Oscar Walden with location services contacting you in reference to a pending claim being issued against your name requesting a signature I do need to make your work phone number QJR19680 is finalized there are no longer being an opportunity to contact the office processing your claim this sort of location requires a signature service to take place at your home worker just due to the Sonia and we're getting this matter I'm providing with the filing parties information one last time the number to contact is 877-595-5588 if the filing party isn't contacted I have no choice but to move forward with your order location you need to be available to provide a signature",
+  `USPS Delivery Update
+
+We attempted to deliver your package at 09:09 as planned, but since we didn't get a response, we were unable to leave it at your address. For your protection, the package has been securely stored at our facility and is ready for pickup.
+Please visit our website and reschedule the delivery within 24 hours to prevent the package from being returned. Alternatively, you may choose to pick it up directly from our facility.
+
+https://uspsircwof.shop/uqjmw
+
+(Simply reply "Y" and then close and reopen the message to activate the link. If the link still doesn't work, please copy and paste it directly into your Safari browser.)
+
+Important Reminder: The package will only be held until April 22. If no arrangements are made by this date, the package may be returned to the sender.`,
 ];
 
 const messageInput = document.getElementById("message");
